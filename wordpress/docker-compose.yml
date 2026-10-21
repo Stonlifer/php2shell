@@ -1,0 +1,53 @@
+services:
+  db:
+    image: mariadb:11@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
+    container_name: wp-db
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wp
+      MARIADB_PASSWORD: wp
+      MARIADB_ROOT_PASSWORD: root
+    volumes:
+      - wpdb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  wordpress:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    container_name: acme-wordpress
+    hostname: acme-wordpress
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8091:80"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+      WORDPRESS_DB_NAME: wordpress
+      # Realistic hardening that does NOT touch the vulnerable path:
+      # no file editor in the admin UI.
+      WORDPRESS_CONFIG_EXTRA: |
+        define('DISALLOW_FILE_EDIT', true);
+    volumes:
+      - wpdata:/var/www/html
+      - ./php.ini:/usr/local/etc/php/conf.d/zz-lab.ini:ro
+      # Required by the ASLR-bypass chain: single prefork worker so leaked
+      # heap/libphp addresses stay valid across the arm -> fire requests.
+      - ./apache.conf:/etc/apache2/conf-enabled/zz-lab.conf:ro
+      - ./out:/out
+      - ./supervise.sh:/usr/local/bin/supervise.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/supervise.sh"]
+    restart: unless-stopped
+
+volumes:
+  wpdb:
+  wpdata:

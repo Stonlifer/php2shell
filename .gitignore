@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime / generated artifacts. Docker creates these bind-mount dirs on
+# first run, and the scripts recreate them, so nothing here is committed.
+out/

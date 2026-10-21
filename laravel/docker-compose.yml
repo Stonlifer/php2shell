@@ -1,0 +1,20 @@
+services:
+  blog:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    container_name: acme-laravel
+    hostname: acme-laravel
+    ports:
+      - "127.0.0.1:8090:80"
+    volumes:
+      - ./php.ini:/usr/local/etc/php/conf.d/zz-lab.ini:ro
+      - ./vhost.conf:/etc/apache2/sites-enabled/000-default.conf:ro
+      # Required for the ASLR-bypass chain: single prefork worker so the
+      # leaked heap/libphp addresses stay valid across requests.
+      - ./apache.conf:/etc/apache2/conf-enabled/zz-lab.conf:ro
+      - ./out:/out
+      - ./supervise.sh:/usr/local/bin/supervise.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/supervise.sh"]
+    restart: unless-stopped

